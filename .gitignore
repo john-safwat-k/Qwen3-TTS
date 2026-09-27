@@ -22,3 +22,9 @@ wheels/
 .vscode/
 venv/
 env/
+*.wav
+*.jsonl
+data/
+ckpt/
+output/
+runs/
