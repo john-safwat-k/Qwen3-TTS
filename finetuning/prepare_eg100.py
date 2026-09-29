@@ -23,6 +23,19 @@ import librosa
 
 TARGET_SR = 24000
 ARABIC_RE = re.compile(r"[؀-ۿ]")
+LATIN_RE = re.compile(r"[A-Za-z]")
+DIGIT_RE = re.compile(r"[0-9٠-٩]")
+TATWEEL_RE = re.compile(r"ـ+")
+BAD_CHARS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")  # zero-width / bidi marks
+
+
+def normalize_text(t):
+    """Light normalisation only - do NOT convert Egyptian spelling to MSA."""
+    t = BAD_CHARS_RE.sub("", str(t))
+    t = TATWEEL_RE.sub("", t)
+    t = t.replace("\u060c", "\u060c ").replace("\u061f", "\u061f ")  # space after Arabic comma / question mark
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
 def find_table(src):
@@ -94,6 +107,12 @@ def main():
     ap.add_argument("--max_dur", type=float, default=20.0)
     ap.add_argument("--language", default="arabic")
     ap.add_argument("--limit", type=int, default=0, help="only process the first N kept rows (quick pilot)")
+    ap.add_argument("--keep_latin", action="store_true", help="keep clips whose text has Latin letters (default: drop)")
+    ap.add_argument("--keep_digits", action="store_true", help="keep clips whose text has digits (default: drop - digits are read inconsistently)")
+    ap.add_argument("--trim_db", type=float, default=40.0, help="trim leading/trailing silence quieter than this (0 = off)")
+    ap.add_argument("--val_ratio", type=float, default=0.02, help="fraction held out to val_raw.jsonl")
+    ap.add_argument("--min_cps", type=float, default=6.0, help="drop clips with fewer chars/sec (likely missing words)")
+    ap.add_argument("--max_cps", type=float, default=25.0, help="drop clips with more chars/sec (likely extra words)")
     args = ap.parse_args()
     src, out = os.path.expanduser(args.src), os.path.expanduser(args.out)
 
@@ -122,12 +141,18 @@ def main():
     if dur_col:
         d = pd.to_numeric(df[dur_col], errors="coerce")
         df = df[(d >= args.min_dur) & (d <= args.max_dur)]
-    print(f"kept {len(df)}/{n0} rows after text/confidence/promo/duration filters")
+    df[text_col] = df[text_col].astype(str).apply(normalize_text)
+    if not args.keep_latin:
+        df = df[~df[text_col].str.contains(LATIN_RE)]
+    if not args.keep_digits:
+        df = df[~df[text_col].str.contains(DIGIT_RE)]
+    print(f"kept {len(df)}/{n0} rows after text/confidence/promo/duration/latin/digit filters")
     if args.limit:
         df = df.head(args.limit)
 
     os.makedirs(os.path.join(out, "wavs"), exist_ok=True)
     rows, src_srs, total_sec = [], {}, 0.0
+    n_bad_cps = 0
     best_ref = None  # (score, path) - longest high-confidence clip between 5 and 12 s
     for n, (idx, r) in enumerate(df.iterrows()):
         try:
@@ -137,15 +162,23 @@ def main():
         src_srs[sr] = src_srs.get(sr, 0) + 1
         if sr != TARGET_SR:
             wav = librosa.resample(wav, orig_sr=sr, target_sr=TARGET_SR)
+        if args.trim_db > 0:
+            _, (a, b) = librosa.effects.trim(wav, top_db=args.trim_db)
+            pad = int(0.15 * TARGET_SR)  # keep ~150 ms of natural silence each side
+            wav = wav[max(0, a - pad): min(len(wav), b + pad)]
         dur = len(wav) / TARGET_SR
         if not (args.min_dur <= dur <= args.max_dur):
+            continue
+        text = str(r[text_col])
+        cps = len(text.replace(" ", "")) / dur
+        if not (args.min_cps <= cps <= args.max_cps):
+            n_bad_cps += 1
             continue
         peak = float(np.max(np.abs(wav))) or 1.0
         wav = (wav / peak * 0.95).astype(np.float32)  # peak-normalise
         path = os.path.abspath(os.path.join(out, "wavs", f"{n:06d}.wav"))
         sf.write(path, wav, TARGET_SR, subtype="PCM_16")
         total_sec += dur
-        text = re.sub(r"\s+", " ", str(r[text_col])).strip()
         rows.append({"audio": path, "text": text, "language": args.language})
         conf = float(r[conf_col]) if conf_col else 1.0
         if 5.0 <= dur <= 12.0 and (best_ref is None or (conf, dur) > best_ref[0]):
@@ -159,12 +192,23 @@ def main():
     for row in rows:
         row["ref_audio"] = ref  # same reference for every sample (recommended by the Qwen README)
 
+    rng = np.random.default_rng(0)
+    idx = rng.permutation(len(rows))
+    n_val = int(len(rows) * args.val_ratio)
+    val_rows = [rows[i] for i in idx[:n_val] if rows[i]["audio"] != ref]
+    train_rows = [rows[i] for i in idx[n_val:]] + [rows[i] for i in idx[:n_val] if rows[i]["audio"] == ref]
+
     jsonl = os.path.join(out, "train_raw.jsonl")
     with open(jsonl, "w", encoding="utf-8") as f:
-        for row in rows:
+        for row in train_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with open(os.path.join(out, "val_raw.jsonl"), "w", encoding="utf-8") as f:
+        for row in val_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"train {len(train_rows)} / val {len(val_rows)}")
 
     print(f"\nwrote {len(rows)} clips, {total_sec/3600:.1f} h -> {jsonl}")
+    print(f"dropped {n_bad_cps} clips with implausible chars/sec (text/audio mismatch)")
     print(f"reference clip: {ref}")
     print(f"source sample rates: {src_srs}")
     if any(s < TARGET_SR for s in src_srs):

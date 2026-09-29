@@ -13,12 +13,25 @@
 #   5. --attn_implementation flag (default sdpa; pass flash_attention_2 if flash-attn works on your GPU).
 #   6. Configurable gradient accumulation (--grad_accum; official script hardcodes 4).
 #   7. Accepts a hub name for --init_model_path (resolved to the local HF cache).
+#
+# v2 fixes (train/inference alignment - same as upstream PR QwenLM/Qwen3-TTS#278, issue #371):
+#   8. Text embeddings now go through talker.text_projection, exactly like inference does.
+#      (v1 fed raw text_embedding -> the model was trained on a different text input than it sees at inference.)
+#   9. Talker loss computed here with ONE shift. v1 sliced inputs[:, :-1] / labels[:, 1:] AND let
+#      ForCausalLMLoss shift again -> the talker learned to predict frame j+2 instead of j+1.
+#  10. Sub-talker gets the hidden state that PREDICTED the frame (codec_mask[:, 1:]), matching
+#      generation's past_hidden. v1 used codec_mask[:, :-1] = a hidden that had already seen the frame (leak).
+#  11. Sub-talker loss computed here without the extra shift (v1 was shifted twice as well).
+#  12. Warmup + cosine LR schedule, separate logging of talker / sub-talker loss, held-out eval loss.
 import argparse
 import json
 import os
 import shutil
 
+import math
+
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from dataset_ar import TTSDatasetWithLanguage
 from huggingface_hub import snapshot_download
@@ -26,7 +39,7 @@ from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoConfig
+from transformers import AutoConfig, get_cosine_schedule_with_warmup
 
 SPEAKER_TOKEN_ID = 3000  # same slot the official script uses for the fine-tuned speaker
 target_speaker_embedding = None
@@ -41,8 +54,11 @@ def train():
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--grad_accum", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-6)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--num_epochs", type=int, default=5)
+    parser.add_argument("--eval_jsonl", type=str, default=None, help="held-out set; eval loss printed each epoch")
+    parser.add_argument("--sub_loss_weight", type=float, default=0.3)
     parser.add_argument("--speaker_name", type=str, default="kazyon_ar")
     parser.add_argument("--language_name", type=str, default="arabic")
     parser.add_argument("--language_token_id", type=int, default=2072)
@@ -107,74 +123,120 @@ def train():
         dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn, num_workers=4
     )
 
+    eval_dataloader = None
+    if args.eval_jsonl:
+        eval_data = [json.loads(line) for line in open(args.eval_jsonl, encoding="utf-8")]
+        eval_ds = TTSDatasetWithLanguage(eval_data, qwen3tts.processor, config)
+        eval_dataloader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, collate_fn=eval_ds.collate_fn, num_workers=2)
+
     optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
 
     model, optimizer, train_dataloader = accelerator.prepare(qwen3tts.model, optimizer, train_dataloader)
+    if eval_dataloader is not None:
+        eval_dataloader = accelerator.prepare(eval_dataloader)
+
+    # scheduler is stepped manually, once per real optimizer update
+    updates_per_epoch = math.ceil(len(train_dataloader) / args.grad_accum)
+    total_updates = updates_per_epoch * args.num_epochs
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(args.warmup_ratio * total_updates), num_training_steps=total_updates
+    )
+    accelerator.print(f"[train] {total_updates} optimizer updates, lr={args.lr}, warmup={int(args.warmup_ratio * total_updates)}")
+
+    def compute_loss(batch):
+        global target_speaker_embedding
+        input_ids = batch["input_ids"]
+        codec_ids = batch["codec_ids"]
+        ref_mels = batch["ref_mels"]
+        text_embedding_mask = batch["text_embedding_mask"]
+        codec_embedding_mask = batch["codec_embedding_mask"]
+        attention_mask = batch["attention_mask"]
+        codec_0_labels = batch["codec_0_labels"]
+        codec_mask = batch["codec_mask"]
+        speaker_pos = batch["speaker_pos"]
+
+        speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+        if target_speaker_embedding is None:
+            target_speaker_embedding = speaker_embedding
+
+        input_text_ids = input_ids[:, :, 0]
+        input_codec_ids = input_ids[:, :, 1]
+
+        # FIX 8: same text path as inference (text_embedding -> text_projection)
+        input_text_embedding = model.talker.text_projection(
+            model.talker.model.text_embedding(input_text_ids)
+        ) * text_embedding_mask
+        input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+        rows = torch.arange(input_codec_embedding.shape[0], device=input_codec_embedding.device)
+        input_codec_embedding[rows, speaker_pos.to(rows.device), :] = speaker_embedding.to(input_codec_embedding.dtype)
+
+        input_embeddings = input_text_embedding + input_codec_embedding
+        for i in range(1, 16):
+            codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+            input_embeddings = input_embeddings + codec_i_embedding * codec_mask.unsqueeze(-1)
+
+        # no labels -> we compute the loss ourselves with exactly one shift
+        outputs = model.talker(
+            inputs_embeds=input_embeddings[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            output_hidden_states=True,
+        )
+        # FIX 9: logits[t] (having seen positions <= t) predicts codec_0 at t+1
+        logits = outputs.logits
+        targets = codec_0_labels[:, 1:].to(logits.device)
+        talker_loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]), targets.reshape(-1), ignore_index=-100
+        )
+
+        # FIX 10: hidden at position p-1 (the one that predicted frame p) -> same as generation's past_hidden
+        hidden_states = outputs.hidden_states[0][-1]  # [B, T-1, H]
+        talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+        talker_codec_ids = codec_ids[codec_mask]
+        sub_logits, _ = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+        # FIX 11: sub_logits[:, k] already predicts codebook k+1 -> no extra shift
+        sub_loss = F.cross_entropy(
+            sub_logits.float().reshape(-1, sub_logits.shape[-1]), talker_codec_ids[:, 1:].reshape(-1)
+        )
+        return talker_loss, sub_loss
+
+    @torch.no_grad()
+    def evaluate():
+        if eval_dataloader is None:
+            return None
+        model.eval()
+        tl, sl, n = 0.0, 0.0, 0
+        for b in eval_dataloader:
+            t, s_ = compute_loss(b)
+            tl += t.item(); sl += s_.item(); n += 1
+        model.train()
+        return tl / max(n, 1), sl / max(n, 1)
 
     model.train()
+    update = 0
 
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                input_ids = batch["input_ids"]
-                codec_ids = batch["codec_ids"]
-                ref_mels = batch["ref_mels"]
-                text_embedding_mask = batch["text_embedding_mask"]
-                codec_embedding_mask = batch["codec_embedding_mask"]
-                attention_mask = batch["attention_mask"]
-                codec_0_labels = batch["codec_0_labels"]
-                codec_mask = batch["codec_mask"]
-                speaker_pos = batch["speaker_pos"]
-
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
-                if target_speaker_embedding is None:
-                    target_speaker_embedding = speaker_embedding
-
-                input_text_ids = input_ids[:, :, 0]
-                input_codec_ids = input_ids[:, :, 1]
-
-                input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                # speaker slot is 6 (no language) or 7 (with language token) - per sample
-                rows = torch.arange(input_codec_embedding.shape[0], device=input_codec_embedding.device)
-                input_codec_embedding[rows, speaker_pos.to(rows.device), :] = speaker_embedding.to(
-                    input_codec_embedding.dtype
-                )
-
-                input_embeddings = input_text_embedding + input_codec_embedding
-
-                for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
-
-                outputs = model.talker(
-                    inputs_embeds=input_embeddings[:, :-1, :],
-                    attention_mask=attention_mask[:, :-1],
-                    labels=codec_0_labels[:, 1:],
-                    output_hidden_states=True,
-                )
-
-                hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-                talker_codec_ids = codec_ids[codec_mask]
-
-                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(
-                    talker_codec_ids, talker_hidden_states
-                )
-
-                loss = outputs.loss + 0.3 * sub_talker_loss
-
+                talker_loss, sub_loss = compute_loss(batch)
+                loss = talker_loss + args.sub_loss_weight * sub_loss
                 accelerator.backward(loss)
-
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
-
                 optimizer.step()
                 optimizer.zero_grad()
+                if accelerator.sync_gradients:
+                    scheduler.step()
+                    update += 1
 
             if step % 10 == 0:
-                accelerator.print(f"Epoch {epoch} | Step {step}/{len(train_dataloader)} | Loss: {loss.item():.4f}")
+                accelerator.print(
+                    f"Epoch {epoch} | Step {step}/{len(train_dataloader)} | update {update}/{total_updates} "
+                    f"| lr {scheduler.get_last_lr()[0]:.2e} | talker {talker_loss.item():.4f} | sub {sub_loss.item():.4f}"
+                )
+
+        ev = evaluate()
+        if ev is not None:
+            accelerator.print(f"[eval] epoch {epoch} | talker {ev[0]:.4f} | sub {ev[1]:.4f}")
 
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
