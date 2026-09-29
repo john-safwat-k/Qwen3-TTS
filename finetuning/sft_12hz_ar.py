@@ -22,6 +22,8 @@
 #  10. Sub-talker gets the hidden state that PREDICTED the frame (codec_mask[:, 1:]), matching
 #      generation's past_hidden. v1 used codec_mask[:, :-1] = a hidden that had already seen the frame (leak).
 #  11. Sub-talker loss computed here without the extra shift (v1 was shifted twice as well).
+#  13. fp32 master weights (bf16 autocast). With bf16 weights, lr*grad updates smaller than
+#      ~0.4% of a weight round to zero - at lr 2e-6 most of v1's updates were silently lost.
 #  12. Warmup + cosine LR schedule, separate logging of talker / sub-talker loss, held-out eval loss.
 import argparse
 import json
@@ -59,6 +61,7 @@ def train():
     parser.add_argument("--num_epochs", type=int, default=5)
     parser.add_argument("--eval_jsonl", type=str, default=None, help="held-out set; eval loss printed each epoch")
     parser.add_argument("--sub_loss_weight", type=float, default=0.3)
+    parser.add_argument("--bf16_weights", action="store_true", help="old behaviour: keep weights in bf16 (less memory, lossy updates)")
     parser.add_argument("--speaker_name", type=str, default="kazyon_ar")
     parser.add_argument("--language_name", type=str, default="arabic")
     parser.add_argument("--language_token_id", type=int, default=2072)
@@ -77,7 +80,7 @@ def train():
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if args.bf16_weights else torch.float32,
         attn_implementation=args.attn_implementation,
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
@@ -206,7 +209,8 @@ def train():
         model.eval()
         tl, sl, n = 0.0, 0.0, 0
         for b in eval_dataloader:
-            t, s_ = compute_loss(b)
+            with accelerator.autocast():
+                t, s_ = compute_loss(b)
             tl += t.item(); sl += s_.item(); n += 1
         model.train()
         return tl / max(n, 1), sl / max(n, 1)
@@ -217,7 +221,8 @@ def train():
     for epoch in range(args.num_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
-                talker_loss, sub_loss = compute_loss(batch)
+                with accelerator.autocast():  # submodule calls bypass prepare()'s autocast
+                    talker_loss, sub_loss = compute_loss(batch)
                 loss = talker_loss + args.sub_loss_weight * sub_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -255,7 +260,10 @@ def train():
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
             unwrapped_model = accelerator.unwrap_model(model)
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+            state_dict = {
+                k: (v.detach().to("cpu").to(torch.bfloat16) if v.is_floating_point() else v.detach().to("cpu"))
+                for k, v in unwrapped_model.state_dict().items()
+            }
 
             for k in [k for k in state_dict if k.startswith("speaker_encoder")]:
                 del state_dict[k]

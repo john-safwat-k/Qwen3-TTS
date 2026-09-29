@@ -21,7 +21,7 @@ Together: the fine-tune taught the model very little that it could use at infere
 
 ## What changed in v2 (branch `arabic-finetune-v2`, uncommitted)
 
-- `sft_12hz_ar.py`: bugs 1-3 fixed (loss computed explicitly with a single shift), LR default 1e-5, warmup + cosine schedule, separate talker/sub-talker loss logs, `--eval_jsonl` held-out loss per epoch.
+- `sft_12hz_ar.py`: fp32 master weights (bf16 weights silently dropped small updates), bugs 1-3 fixed (loss computed explicitly with a single shift), LR default 1e-5, warmup + cosine schedule, separate talker/sub-talker loss logs, `--eval_jsonl` held-out loss per epoch.
 - `prepare_eg100.py`: silence trim, light text normalisation (no MSA conversion), drops clips with digits or Latin letters (flags to keep them), drops clips with an implausible chars-per-second rate (text/audio mismatch), writes `val_raw.jsonl` (2%).
 - `check_codec_roundtrip.py`: encode/decode clips to check that the codec itself sounds native.
 - `test_arabic.py`: fixed Egyptian test sentences, always with `language="Arabic"`.
